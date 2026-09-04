@@ -1,4 +1,4 @@
-# mist-enroll
+# UoP Mist Enrollment for Linux
 
 Enrolls a Linux machine with Juniper Mist NAC over SCEP and writes ready-to-use
 NetworkManager 802.1X (EAP-TLS) profiles for **wireless** and **wired**.
