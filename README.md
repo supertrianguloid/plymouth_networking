@@ -60,3 +60,7 @@ python3 tests/run.py
 
 Runs against a mock SCEP CA backed by a real openssl CA; `openssl` is required
 for the tests as well.
+
+## Declaration
+
+Originally written in `nu` and then translated with Claude's help to `python3` with zero dependencies other than `openssl`.
