@@ -1,0 +1,260 @@
+#!/usr/bin/env python3
+"""Install mist-enroll profiles through nmcli using persistent PEM files.
+
+This is primarily for Ubuntu systems where NetworkManager is integrated with
+Netplan.  Installing keyfiles containing inline certificate data can leave the
+generated connection referring to temporary files below /run after a reboot.
+Creating the connections through nmcli and referring to persistent PEM files
+avoids that failure mode.
+"""
+
+import argparse
+import base64
+import configparser
+import hashlib
+import os
+import shutil
+import subprocess
+import sys
+
+
+DEFAULT_CERT_ROOT = "/etc/NetworkManager/certificates"
+DEFAULT_WIFI_PROFILE = "plymouth_eduroam.nmconnection"
+DEFAULT_WIRED_PROFILE = "plymouth_wired.nmconnection"
+
+
+class InstallError(Exception):
+    pass
+
+
+def read_profile(path, expected_type):
+    parser = configparser.ConfigParser(interpolation=None)
+    parser.optionxform = str
+    try:
+        with open(path, encoding="utf-8") as handle:
+            parser.read_file(handle)
+    except (OSError, configparser.Error) as exc:
+        raise InstallError("cannot read %s: %s" % (path, exc)) from exc
+
+    required = {
+        "connection": ("id", "type"),
+        "802-1x": ("eap", "identity", "ca-cert", "client-cert", "private-key"),
+    }
+    for section, keys in required.items():
+        if not parser.has_section(section):
+            raise InstallError("%s has no [%s] section" % (path, section))
+        for key in keys:
+            if key not in parser[section]:
+                raise InstallError("%s has no %s.%s value" % (path, section, key))
+
+    if parser["connection"]["type"] != expected_type:
+        raise InstallError(
+            "%s is %s, expected %s"
+            % (path, parser["connection"]["type"], expected_type)
+        )
+    if parser["802-1x"]["eap"] != "tls":
+        raise InstallError("%s does not use EAP-TLS" % path)
+
+    values = {
+        "id": parser["connection"]["id"],
+        "identity": parser["802-1x"]["identity"],
+        "ca": decode_blob(path, "ca-cert", parser["802-1x"]["ca-cert"]),
+        "client": decode_blob(path, "client-cert", parser["802-1x"]["client-cert"]),
+        "key": decode_blob(path, "private-key", parser["802-1x"]["private-key"]),
+    }
+    if expected_type == "wifi":
+        if not parser.has_section("wifi") or "ssid" not in parser["wifi"]:
+            raise InstallError("%s has no wifi.ssid value" % path)
+        values["ssid"] = parser["wifi"]["ssid"]
+    return values
+
+
+def decode_blob(path, field, value):
+    prefix = "data:;base64,"
+    if not value.startswith(prefix):
+        raise InstallError(
+            "%s: %s is not an embedded data:;base64 value" % (path, field)
+        )
+    try:
+        result = base64.b64decode(value[len(prefix):], validate=True)
+    except (ValueError, base64.binascii.Error) as exc:
+        raise InstallError("%s: %s is not valid base64" % (path, field)) from exc
+    if field == "private-key":
+        marker = b"-----BEGIN PRIVATE KEY-----"
+    else:
+        marker = b"-----BEGIN CERTIFICATE-----"
+    if marker not in result:
+        raise InstallError("%s: %s is not the expected PEM data" % (path, field))
+    return result
+
+
+def matching_material(wifi, wired):
+    return all(wifi[name] == wired[name] for name in ("identity", "ca", "client", "key"))
+
+
+def certificate_dir(cert_root, material):
+    digest = hashlib.sha256(material["client"] + material["key"]).hexdigest()[:12]
+    return os.path.join(cert_root, "plymouth-" + digest)
+
+
+def write_certificates(directory, material):
+    os.makedirs(directory, mode=0o700, exist_ok=False)
+    paths = {}
+    for name, filename in (
+        ("ca", "ca-cert.pem"),
+        ("client", "client-cert.pem"),
+        ("key", "private-key.pem"),
+    ):
+        path = os.path.join(directory, filename)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(material[name])
+        os.chmod(path, 0o600)
+        paths[name] = path
+    return paths
+
+
+def connection_names(wifi, wired, suffix):
+    return wifi["id"] + suffix, wired["id"] + suffix
+
+
+def command_plan(wifi, wired, paths, wifi_name, wired_name,
+                 wifi_interface=None, wired_interface=None):
+    wifi_ifname = wifi_interface or "*"
+    wired_ifname = wired_interface or "*"
+    common_wifi = [
+        "connection.autoconnect", "yes",
+        "wifi-sec.key-mgmt", "wpa-eap",
+        "802-1x.eap", "tls",
+        "802-1x.identity", wifi["identity"],
+        "802-1x.ca-cert", paths["ca"],
+        "802-1x.client-cert", paths["client"],
+        "802-1x.private-key", paths["key"],
+        "802-1x.private-key-password-flags", "4",
+        "ipv4.method", "auto",
+        "ipv6.method", "auto",
+    ]
+    common_wired = [
+        "connection.autoconnect", "yes",
+        "connection.autoconnect-priority", "10",
+        "802-1x.eap", "tls",
+        "802-1x.identity", wired["identity"],
+        "802-1x.ca-cert", paths["ca"],
+        "802-1x.client-cert", paths["client"],
+        "802-1x.private-key", paths["key"],
+        "802-1x.private-key-password-flags", "4",
+        "ipv4.method", "auto",
+        "ipv6.method", "auto",
+    ]
+    return [
+        ["nmcli", "connection", "add", "type", "wifi", "ifname", wifi_ifname,
+         "con-name", wifi_name, "ssid", wifi["ssid"]],
+        ["nmcli", "connection", "modify", wifi_name] + common_wifi,
+        ["nmcli", "connection", "add", "type", "ethernet", "ifname", wired_ifname,
+         "con-name", wired_name],
+        ["nmcli", "connection", "modify", wired_name] + common_wired,
+    ]
+
+
+def existing_connections():
+    result = subprocess.run(
+        ["nmcli", "-g", "NAME", "connection", "show"],
+        check=True, capture_output=True, text=True,
+    )
+    return set(result.stdout.splitlines())
+
+
+def run_command(command):
+    subprocess.run(command, check=True)
+
+
+def install(args):
+    if os.geteuid() != 0:
+        raise InstallError("run this installer with sudo")
+    if not shutil.which("nmcli"):
+        raise InstallError("nmcli is not installed")
+
+    wifi = read_profile(args.wifi_profile, "wifi")
+    wired = read_profile(args.wired_profile, "802-3-ethernet")
+    if not matching_material(wifi, wired):
+        raise InstallError("the wireless and wired profiles contain different credentials")
+
+    wifi_name, wired_name = connection_names(wifi, wired, args.name_suffix)
+    existing = existing_connections()
+    clashes = [name for name in (wifi_name, wired_name) if name in existing]
+    if clashes:
+        raise InstallError(
+            "connection name%s already exist%s: %s; use --name-suffix for a safe test install"
+            % ("s" if len(clashes) > 1 else "", "" if len(clashes) > 1 else "s",
+               ", ".join(clashes))
+        )
+
+    directory = certificate_dir(args.cert_root, wifi)
+    if os.path.exists(directory):
+        raise InstallError(
+            "%s already exists; no changes made. Remove it only after checking it is unused."
+            % directory
+        )
+
+    created = []
+    try:
+        paths = write_certificates(directory, wifi)
+        for command in command_plan(
+                wifi, wired, paths, wifi_name, wired_name,
+                args.wifi_interface, args.wired_interface):
+            run_command(command)
+            if command[2] == "add":
+                created.append(command[command.index("con-name") + 1])
+        if args.activate_wired:
+            command = ["nmcli", "connection", "up", wired_name]
+            if args.wired_interface:
+                command += ["ifname", args.wired_interface]
+            run_command(command)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        for name in reversed(created):
+            subprocess.run(["nmcli", "connection", "delete", name],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        shutil.rmtree(directory, ignore_errors=True)
+        raise InstallError("installation failed and was rolled back: %s" % exc) from exc
+
+    print("Installed NetworkManager connections:")
+    print("  %s" % wifi_name)
+    print("  %s" % wired_name)
+    print("Certificates are in %s (root-only)." % directory)
+    if not args.activate_wired:
+        print("The current network was not changed. Activate the new wired profile with:")
+        command = "sudo nmcli connection up %s" % shell_quote(wired_name)
+        if args.wired_interface:
+            command += " ifname %s" % shell_quote(args.wired_interface)
+        print("  %s" % command)
+
+
+def shell_quote(value):
+    return "'" + value.replace("'", "'\\''") + "'"
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--wifi-profile", default=DEFAULT_WIFI_PROFILE)
+    parser.add_argument("--wired-profile", default=DEFAULT_WIRED_PROFILE)
+    parser.add_argument("--wifi-interface")
+    parser.add_argument("--wired-interface")
+    parser.add_argument("--name-suffix", default="")
+    parser.add_argument("--cert-root", default=DEFAULT_CERT_ROOT,
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--activate-wired", action="store_true",
+                        help="activate the new wired profile after installing it")
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    try:
+        install(parse_args(argv))
+        return 0
+    except InstallError as exc:
+        print("Error: %s" % exc, file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

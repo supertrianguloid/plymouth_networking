@@ -6,10 +6,12 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import test_e2e
+import test_installer
 import test_units
 
 SUITES = [
     ("unit tests (DER structures, openssl wrapper)", test_units.run),
+    ("installer tests (persistent credentials + nmcli)", test_installer.run),
     ("end-to-end tests (mock SCEP CA + CLI)", test_e2e.run),
 ]
 

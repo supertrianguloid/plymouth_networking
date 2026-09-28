@@ -13,7 +13,10 @@ Python 3 and `openssl`.
 2. Sign in, then click **Install network profile**
 3. Copy the entire `marvisclient://api.eu.mist.com/...` link
 
-If the link doesn't appear, try another browser such as Chromium — Firefox did not work for me.
+Firefox may try to open the installed Marvis Client without displaying the URL.
+Chromium has worked for some users, but this is browser- and desktop-dependent;
+do not assume that changing browser will expose the URL. The URL is a short-lived
+enrolment credential, so do not paste it into shell history, logs, issues or chat.
 
 ## Usage
 
@@ -35,6 +38,42 @@ sudo install -o root -g root -m 600 plymouth_wired.nmconnection /etc/NetworkMana
 sudo nmcli connection reload
 shred -u plymouth_eduroam.nmconnection plymouth_wired.nmconnection
 ```
+
+### Ubuntu 24.04 / Netplan
+
+On Ubuntu systems where NetworkManager connections are managed through Netplan,
+installing the generated keyfiles directly can result in their inline
+certificates being materialised below `/run`. Those temporary files may be
+missing after reboot, causing the misleading error `Secrets were required, but
+not provided`.
+
+The optional installer avoids that failure mode. It extracts the credentials to
+a persistent root-only directory and creates fresh NetworkManager connections
+through `nmcli`, allowing Netplan to persist them correctly:
+
+```sh
+sudo ./install-profiles --wired-interface YOUR_WIRED_INTERFACE
+```
+
+For example, find interface names with:
+
+```sh
+nmcli -f DEVICE,TYPE,STATE device status
+```
+
+The installer refuses to overwrite an existing connection or certificate
+directory. For a parallel test that leaves existing profiles untouched, use a
+suffix:
+
+```sh
+sudo ./install-profiles \
+  --wired-interface YOUR_WIRED_INTERFACE \
+  --name-suffix _test
+```
+
+It does not activate the new connection unless `--activate-wired` is supplied.
+Keep a working network fallback available, and test reboot behaviour only when
+you have local access to the machine.
 
 ## ⚠️ These files contain your private key
 

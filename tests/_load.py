@@ -5,6 +5,7 @@ import os
 
 SCRIPT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                       "mist-enroll")
+INSTALLER = os.path.join(os.path.dirname(SCRIPT), "install-profiles")
 
 
 def load():
@@ -16,6 +17,17 @@ def load():
 
 
 me = load()
+
+
+def load_installer():
+    loader = importlib.machinery.SourceFileLoader("install_profiles", INSTALLER)
+    spec = importlib.util.spec_from_loader("install_profiles", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+installer = load_installer()
 
 
 class Checker:
